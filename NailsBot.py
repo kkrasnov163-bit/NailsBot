@@ -38,7 +38,7 @@ load_env(os.path.join(BASE, ".env"))
 
 # ───────────────────────── НАСТРОЙКИ ─────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x]
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 SALON_NAME = os.environ.get("SALON_NAME", "Nail Studio")
 MAX_ACTIVE_PER_USER = int(os.environ.get("MAX_ACTIVE_PER_USER", "3"))
 LOCK_PORT = int(os.environ.get("LOCK_PORT", "47653"))
