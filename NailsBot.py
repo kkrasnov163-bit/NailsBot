@@ -1,5 +1,6 @@
 """
 Телеграм-бот записи для маникюр-салона. БЕЗ внешних библиотек — только стандартный Python 3.8+.
+Настройки берутся из файла .env (рядом с bot.py) или из переменных окружения.
 Запуск:  python bot.py
 """
 import calendar as pycal
@@ -8,17 +9,39 @@ import html
 import io
 import json
 import logging
+import os
+import socket
 import sqlite3
 import time as _time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
 
-# ───────────────────────── НАСТРОЙКИ (впишите свои) ─────────────────────────
-BOT_TOKEN = "8932765028:AAEPstLQ25ofNNL7d6Es4jO0PXumuuI1WVo"       # токен от @BotFather
-ADMIN_IDS = {1057772062}            # ваш ID от @userinfobot (несколько: {111, 222})
-SALON_NAME = "Nail Studio"
-MAX_ACTIVE_PER_USER = 3              # макс. активных записей у одного клиента
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+# ───────────────────────── Загрузка .env ─────────────────────────
+def load_env(path):
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_env(os.path.join(BASE, ".env"))
+
+# ───────────────────────── НАСТРОЙКИ ─────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+SALON_NAME = os.environ.get("SALON_NAME", "Nail Studio")
+MAX_ACTIVE_PER_USER = int(os.environ.get("MAX_ACTIVE_PER_USER", "3"))
+LOCK_PORT = int(os.environ.get("LOCK_PORT", "47653"))
+
 # Услуги и цены: (название, цена). Цена — любой текст, например "1500 ₽" или "€35".
 SERVICES = [
     ("Маникюр + гель-лак", "2000 ₽"),
@@ -30,6 +53,9 @@ SERVICES = [
 DEFAULTS = {"work_start": "10:00", "work_end": "19:00", "slot_min": "60", "days_off": "6"}  # 6 = воскресенье
 # ────────────────────────────────────────────────────────────────────────────
 
+if not BOT_TOKEN or "PASTE_NEW_TOKEN" in BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан. Впишите токен в файл .env рядом с bot.py")
+
 WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август",
           "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -37,17 +63,33 @@ LEGEND = "🟢 есть время   🔴 занято   ⚫ закрыто"
 EMOJI = {"free": "🟢", "full": "🔴", "closed": "⚫"}
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+
+# ───────────────────────── Защита от двойного запуска ─────────────────────────
+_lock_sock = None
+
+
+def single_instance():
+    """Если бот уже запущен (на этом сервере), второй экземпляр завершится."""
+    global _lock_sock
+    _lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _lock_sock.bind(("127.0.0.1", LOCK_PORT))
+    except OSError:
+        raise SystemExit("Бот уже запущен (занят порт блокировки). Остановите старый процесс.")
+
+
 # ───────────────────────── Telegram API ─────────────────────────
 def api(method, **params):
+    params = {k: v for k, v in params.items() if v is not None}   # не отправляем null
     req = urllib.request.Request(f"{API}/{method}", data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.load(r).get("result")
     except urllib.error.HTTPError as e:
-        logging.warning("%s: %s", method, e.read().decode()[:200])
+        logging.error("%s HTTP %s: %s", method, e.code, e.read().decode()[:300])
     except Exception as e:
-        logging.warning("%s: %s", method, e)
+        logging.error("%s: %s", method, e)
     return None
 
 
@@ -65,7 +107,7 @@ def send_document(chat_id, filename, content: bytes):
     try:
         urllib.request.urlopen(req, timeout=60).read()
     except Exception as e:
-        logging.warning("sendDocument: %s", e)
+        logging.error("sendDocument: %s", e)
 
 
 def notify_admins(text, kb=None):
@@ -74,7 +116,7 @@ def notify_admins(text, kb=None):
 
 
 # ───────────────────────── База данных ─────────────────────────
-db = sqlite3.connect("salon.db")
+db = sqlite3.connect(os.path.join(BASE, "salon.db"))
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
@@ -285,50 +327,59 @@ def on_message(m):
 
     if text == "/cancel":
         states.pop(uid, None)
-        return send(chat, "Действие отменено.", MAIN_KB)
+        send(chat, "Действие отменено.", MAIN_KB)
+        return
     if text == "/start":
         states.pop(uid, None)
         send(chat, f"Привет! Это бот записи в <b>{esc(SALON_NAME)}</b> 💅\n"
                    "Нажмите «📅 Записаться», чтобы выбрать дату и время.", MAIN_KB)
-        # ← дополнительная кнопка «просто выводит список услуг с ценами»
-        return send(chat, "💅 <b>Услуги и цены</b>:",
-                    kbd([[btn("📋 Показать прайс-лист", "show_prices")]]))
+        send(chat, "💅 <b>Услуги и цены</b>:", kbd([[btn("📋 Показать прайс-лист", "show_prices")]]))
+        return
     if text == "/admin" and is_admin(uid):
         states.pop(uid, None)
-        return send(chat, "🛠 Админ-панель", PANEL_KB)
+        send(chat, "🛠 Админ-панель", PANEL_KB)
+        return
 
     # --- диалоги по шагам
     if st:
         s = st["s"]
         if s == "name" and text:
             st.update(s="phone", name=text[:60])
-            return send(chat, "Оставьте номер телефона (кнопкой или текстом):",
-                        {"keyboard": [[{"text": "📱 Отправить мой номер", "request_contact": True}]],
-                         "resize_keyboard": True, "one_time_keyboard": True})
+            send(chat, "Оставьте номер телефона (кнопкой или текстом):",
+                 {"keyboard": [[{"text": "📱 Отправить мой номер", "request_contact": True}]],
+                  "resize_keyboard": True, "one_time_keyboard": True})
+            return
         if s == "phone":
             phone = (m.get("contact") or {}).get("phone_number") or text
             if sum(c.isdigit() for c in phone) < 6:
-                return send(chat, "Не похоже на номер телефона, попробуйте ещё раз.")
-            return finish_booking(chat, user, states.pop(uid), phone)
+                send(chat, "Не похоже на номер телефона, попробуйте ещё раз.")
+                return
+            finish_booking(chat, user, states.pop(uid), phone)
+            return
         if is_admin(uid) and text:
             if s == "amsg":
                 states.pop(uid)
                 r = send(st["uid"], f"💌 Сообщение от салона:\n{esc(text)}")
-                return send(chat, "Отправлено ✅" if r else "Не удалось отправить (клиент мог заблокировать бота).")
+                send(chat, "Отправлено ✅" if r else "Не удалось отправить (клиент мог заблокировать бота).")
+                return
             if s == "hours":
                 try:
                     a, b = [x.strip() for x in text.split("-")]
                     datetime.strptime(a, "%H:%M"); datetime.strptime(b, "%H:%M")
                     assert a < b
                 except Exception:
-                    return send(chat, "Неверный формат. Пример: 10:00-19:00")
+                    send(chat, "Неверный формат. Пример: 10:00-19:00")
+                    return
                 put("work_start", a); put("work_end", b); states.pop(uid)
-                return send(chat, "Сохранено ✅", kbd([[btn("⚙️ К настройкам", "aset")]]))
+                send(chat, "Сохранено ✅", kbd([[btn("⚙️ К настройкам", "aset")]]))
+                return
             if s == "slot":
                 if not text.isdigit() or not 15 <= int(text) <= 480:
-                    return send(chat, "Введите число от 15 до 480.")
+                    send(chat, "Введите число от 15 до 480.")
+                    return
                 put("slot_min", int(text)); states.pop(uid)
-                return send(chat, "Сохранено ✅ (созданные записи не пропадут)", kbd([[btn("⚙️ К настройкам", "aset")]]))
+                send(chat, "Сохранено ✅ (созданные записи не пропадут)", kbd([[btn("⚙️ К настройкам", "aset")]]))
+                return
             if s == "broadcast":
                 states.pop(uid)
                 ok = 0
@@ -336,23 +387,28 @@ def on_message(m):
                     if send(r["user_id"], f"📢 {esc(SALON_NAME)}:\n{esc(text)}"):
                         ok += 1
                     _time.sleep(0.05)
-                return send(chat, f"Отправлено: {ok}")
+                send(chat, f"Отправлено: {ok}")
+                return
         return
 
     # --- меню клиента
     if text in ("💅 Прайс-лист", "💰 Услуги и цены", "/prices"):
-        return send(chat, services_text(), kbd([[btn("📅 Записаться", "book")]]))
+        send(chat, services_text(), kbd([[btn("📅 Записаться", "book")]]))
+        return
     if text in ("📅 Записаться", "/book"):
-        return send(chat, "Выберите услугу:", services_kb())
+        send(chat, "Выберите услугу:", services_kb())
+        return
     if text in ("📋 Мои записи", "/my"):
         rows = db.execute("SELECT * FROM bookings WHERE user_id=? AND status='active' AND date>=? ORDER BY date,time",
                           (uid, date.today().isoformat())).fetchall()
         if not rows:
-            return send(chat, "У вас нет активных записей.")
+            send(chat, "У вас нет активных записей.")
+            return
         kb = [[btn(f"❌ Отменить {date.fromisoformat(r['date']).strftime('%d.%m')} {r['time']}", f"cancel:{r['id']}")]
               for r in rows]
-        return send(chat, "Ваши записи:\n" + "\n".join(
+        send(chat, "Ваши записи:\n" + "\n".join(
             f"• {fmt(date.fromisoformat(r['date']))}, {r['time']}{esc(svc_label(r))}" for r in rows), kbd(kb))
+        return
 
     # --- любое другое сообщение клиента уходит администратору
     if text and not text.startswith("/") and not is_admin(uid):
@@ -373,7 +429,8 @@ def finish_booking(chat, user, data, phone):
                     datetime.now().isoformat(timespec="seconds"), sname, sprice))
         db.commit()
     except sqlite3.IntegrityError:
-        return send(chat, "Это время только что заняли 😔 Выберите другое.", MAIN_KB)
+        send(chat, "Это время только что заняли 😔 Выберите другое.", MAIN_KB)
+        return
     send(chat, f"✅ Вы записаны на <b>{fmt(d)}, {data['time']}</b>\n"
                f"Услуга: {esc(sname)} — {esc(sprice)}\n"
                "Отменить запись можно в разделе «📋 Мои записи».", MAIN_KB)
@@ -387,10 +444,14 @@ def finish_booking(chat, user, data, phone):
 def on_callback(cq):
     alert = None
     try:
-        alert = route_callback(cq)
+        res = route_callback(cq)
+        # ВАЖНО: показываем алерт только если вернулась строка.
+        # Раньше сюда попадали словари от send() — отсюда и «null».
+        alert = res if isinstance(res, str) else None
     except Exception:
         logging.exception("callback error")
-    api("answerCallbackQuery", callback_query_id=cq["id"], text=alert, show_alert=bool(alert))
+    api("answerCallbackQuery", callback_query_id=cq["id"], text=alert,
+        show_alert=True if alert else None)
 
 
 def route_callback(cq):
@@ -408,16 +469,18 @@ def route_callback(cq):
 
     # ---------- клиент ----------
     if data == "show_prices":
-        return edit(services_text(), kbd([
-            [btn("📅 Записаться", "book")],
-        ]))
+        edit(services_text(), kbd([[btn("📅 Записаться", "book")]]))
+        return
     if data == "book":
-        return edit("Выберите услугу:", services_kb())
+        edit("Выберите услугу:", services_kb())
+        return
     if data.startswith("svc:"):
         choice[uid] = int(data[4:])
-        return edit(cal_text(uid), calendar_kb(0))
+        edit(cal_text(uid), calendar_kb(0))
+        return
     if data.startswith("cal:"):
-        return edit(cal_text(uid), calendar_kb(int(data[4:])))
+        edit(cal_text(uid), calendar_kb(int(data[4:])))
+        return
     if data.startswith("day:"):
         d = date.fromisoformat(data[4:])
         btns = []
@@ -426,7 +489,8 @@ def route_callback(cq):
                 btns.append(btn(f"🟢 {t}", f"slot:{d.isoformat()}:{t.replace(':', '')}"))
             else:
                 btns.append(btn(f"{'🔴' if st == 'busy' else '⚫'} {t}", "busy" if st == "busy" else "closed"))
-        return edit(f"<b>{fmt(d)}</b>\nВыберите время:", kbd(chunk(btns) + [[btn("⬅ К календарю", "cal:0")]]))
+        edit(f"<b>{fmt(d)}</b>\nВыберите время:", kbd(chunk(btns) + [[btn("⬅ К календарю", "cal:0")]]))
+        return
     if data.startswith("slot:"):
         _, ds, hhmm = data.split(":")
         t, d = f"{hhmm[:2]}:{hhmm[2:]}", date.fromisoformat(ds)
@@ -439,33 +503,41 @@ def route_callback(cq):
         if active >= MAX_ACTIVE_PER_USER:
             return f"Максимум активных записей: {MAX_ACTIVE_PER_USER}. Отмените одну из текущих."
         states[uid] = {"s": "name", "date": ds, "time": t, "svc": choice[uid]}
-        send(chat, f"Вы выбрали <b>{fmt(d)}, {t}</b>\n{esc(SERVICES[choice[uid]][0])} — {esc(SERVICES[choice[uid]][1])}\nКак вас зовут? (отмена: /cancel)", {"remove_keyboard": True})
+        send(chat, f"Вы выбрали <b>{fmt(d)}, {t}</b>\n{esc(SERVICES[choice[uid]][0])} — "
+                   f"{esc(SERVICES[choice[uid]][1])}\nКак вас зовут? (отмена: /cancel)", {"remove_keyboard": True})
         return
     if data.startswith("cancel:"):
         bid = data.split(":")[1]
-        return edit("Точно отменить запись?", kbd([[btn("Да, отменить", f"cancelyes:{bid}"), btn("Нет", "cancelno")]]))
+        edit("Точно отменить запись?", kbd([[btn("Да, отменить", f"cancelyes:{bid}"), btn("Нет", "cancelno")]]))
+        return
     if data == "cancelno":
-        return edit("Хорошо, запись сохранена 👍")
+        edit("Хорошо, запись сохранена 👍")
+        return
     if data.startswith("cancelyes:"):
         r = db.execute("SELECT * FROM bookings WHERE id=? AND user_id=? AND status='active'",
                        (int(data.split(":")[1]), uid)).fetchone()
         if not r:
-            return edit("Запись не найдена или уже отменена.")
+            edit("Запись не найдена или уже отменена.")
+            return
         db.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (r["id"],))
         db.commit()
         edit("Запись отменена ✅")
-        return notify_admins(f"❌ Клиент отменил запись: <b>{fmt(date.fromisoformat(r['date']))} {r['time']}</b>\n"
-                             f"{esc(r['name'])}, {esc(r['phone'])}")
+        notify_admins(f"❌ Клиент отменил запись: <b>{fmt(date.fromisoformat(r['date']))} {r['time']}</b>\n"
+                      f"{esc(r['name'])}, {esc(r['phone'])}")
+        return
 
     # ---------- админ ----------
     if not data.startswith("a") or not is_admin(uid):
         return
     if data == "apanel":
-        return edit("🛠 Админ-панель", PANEL_KB)
+        edit("🛠 Админ-панель", PANEL_KB)
+        return
     if data.startswith("acal:"):
-        return edit(f"Выберите день:\n{LEGEND}", calendar_kb(int(data[5:]), "a"))
+        edit(f"Выберите день:\n{LEGEND}", calendar_kb(int(data[5:]), "a"))
+        return
     if data.startswith("aday:"):
-        return edit(*admin_day_view(date.fromisoformat(data[5:])))
+        edit(*admin_day_view(date.fromisoformat(data[5:])))
+        return
     if data.startswith("ablock:"):
         _, ds, hhmm = data.split(":")
         t = f"{hhmm[:2]}:{hhmm[2:]}"
@@ -474,7 +546,8 @@ def route_callback(cq):
         else:
             db.execute("INSERT INTO blocked VALUES(?,?)", (ds, t))
         db.commit()
-        return edit(*admin_day_view(date.fromisoformat(ds)))
+        edit(*admin_day_view(date.fromisoformat(ds)))
+        return
     if data.startswith("adayblock:"):
         ds = data[10:]
         if db.execute("SELECT 1 FROM blocked WHERE date=? AND time=''", (ds,)).fetchone():
@@ -482,7 +555,8 @@ def route_callback(cq):
         else:
             db.execute("INSERT INTO blocked VALUES(?, '')", (ds,))
         db.commit()
-        return edit(*admin_day_view(date.fromisoformat(ds)))
+        edit(*admin_day_view(date.fromisoformat(ds)))
+        return
     if data.startswith("abk:"):
         r = db.execute("SELECT * FROM bookings WHERE id=?", (int(data[4:]),)).fetchone()
         if not r:
@@ -491,10 +565,11 @@ def route_callback(cq):
                 f"Услуга: {esc(r['service'] or '—')} — {esc(r['price'] or '')}\n"
                 f"Имя: {esc(r['name'])}\nТелефон: {esc(r['phone'])}\n"
                 f"Username: {'@' + esc(r['username']) if r['username'] else '—'}")
-        return edit(text, kbd([
+        edit(text, kbd([
             [btn("✉ Написать клиенту", f"amsg:{r['user_id']}"), btn("❌ Отменить запись", f"acancel:{r['id']}")],
             [btn("👤 Профиль в Telegram", url=f"tg://user?id={r['user_id']}")],
             [btn("⬅ Назад", f"aday:{r['date']}")]]))
+        return
     if data.startswith("acancel:"):
         r = db.execute("SELECT * FROM bookings WHERE id=? AND status='active'", (int(data[8:]),)).fetchone()
         if not r:
@@ -503,39 +578,52 @@ def route_callback(cq):
         db.commit()
         send(r["user_id"], f"К сожалению, ваша запись на {fmt(date.fromisoformat(r['date']))} {r['time']} "
                            "была отменена администратором. Запишитесь на другое время 🙏")
-        return edit(*admin_day_view(date.fromisoformat(r["date"])))
+        edit(*admin_day_view(date.fromisoformat(r["date"])))
+        return
     if data.startswith("amsg:"):
         states[uid] = {"s": "amsg", "uid": int(data[5:])}
-        return send(chat, "Напишите сообщение клиенту (отмена: /cancel):")
+        send(chat, "Напишите сообщение клиенту (отмена: /cancel):")
+        return
     if data == "aset":
-        return edit(*settings_view())
+        edit(*settings_view())
+        return
     if data.startswith("adow:"):
         off = days_off()
         off.symmetric_difference_update({int(data[5:])})
         put("days_off", ",".join(map(str, sorted(off))))
-        return edit(*settings_view())
+        edit(*settings_view())
+        return
     if data == "aset_hours":
         states[uid] = {"s": "hours"}
-        return send(chat, "Введите часы работы в формате <code>10:00-19:00</code>")
+        send(chat, "Введите часы работы в формате <code>10:00-19:00</code>")
+        return
     if data == "aset_slot":
         states[uid] = {"s": "slot"}
-        return send(chat, "Введите длительность записи в минутах (15–480), например 90")
+        send(chat, "Введите длительность записи в минутах (15–480), например 90")
+        return
     if data == "abroad":
         states[uid] = {"s": "broadcast"}
-        return send(chat, "Введите текст рассылки всем, кто когда-либо записывался (отмена: /cancel):")
+        send(chat, "Введите текст рассылки всем, кто когда-либо записывался (отмена: /cancel):")
+        return
     if data == "aexport":
         buf = io.StringIO()
         w = csv.writer(buf, delimiter=";")
         w.writerow(["ID", "Дата", "Время", "Услуга", "Цена", "Имя", "Телефон", "Username", "Статус", "Создана"])
         for r in db.execute("SELECT * FROM bookings ORDER BY date, time"):
-            w.writerow([r["id"], r["date"], r["time"], r["service"] or "", r["price"] or "", r["name"], r["phone"], r["username"] or "",
-                        r["status"], r["created_at"]])
-        return send_document(chat, "bookings.csv", buf.getvalue().encode("utf-8-sig"))
+            w.writerow([r["id"], r["date"], r["time"], r["service"] or "", r["price"] or "", r["name"],
+                        r["phone"], r["username"] or "", r["status"], r["created_at"]])
+        send_document(chat, "bookings.csv", buf.getvalue().encode("utf-8-sig"))
+        return
 
 
 # ───────────────────────── Запуск ─────────────────────────
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.FileHandler(os.path.join(BASE, "bot.log"), encoding="utf-8"),
+                                  logging.StreamHandler()])
+    single_instance()
+    if not ADMIN_IDS:
+        logging.warning("ADMIN_IDS пуст — админ-панель будет недоступна")
     me = api("getMe")
     if not me:
         raise SystemExit("Не удалось подключиться. Проверьте BOT_TOKEN и интернет.")
